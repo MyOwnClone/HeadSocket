@@ -28,6 +28,13 @@
 #endif
 #endif
 
+#define HEADSOCKET_SWAP16(value) (((value) >> 8) | ((value) << 8))
+#define HEADSOCKET_SWAP32(value) \
+  ((((value) >> 24) & 0xFF) | \
+  (((value) << 8) & 0xFF0000) | \
+  (((value) >> 8) & 0xFF00) | \
+  (((value) << 24) & 0xFF000000))
+
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /* Forward declarations */
@@ -36,18 +43,10 @@ namespace std { class thread; }
 namespace headsocket {
 
 /* Forward declarations */
+struct ConnectionParams;
 class SHA1;
 class TcpServer;
 class TcpClient;
-
-///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
-
-class WebSocketServer
-{
-public:
-  WebSocketServer(int port);
-  ~WebSocketServer();
-};
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -79,10 +78,10 @@ private:
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-struct Base64
+struct Encoding
 {
-  static size_t encode(const void *src, size_t srcLength, void *dst, size_t dstLength);
-  static size_t decode(const void *src, size_t srcLength, void *dst, size_t dstLength);
+  static size_t base64(const void *src, size_t srcLength, void *dst, size_t dstLength);
+  static size_t xor32(uint32_t key, void *ptr, size_t length);
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -91,21 +90,20 @@ class TcpServer
 {
 public:
   TcpServer(int port);
-  ~TcpServer();
+  virtual ~TcpServer();
 
-  struct Driver
-  {
-    virtual void onTcpClientConnected(TcpServer *sender, TcpClient *client) { }
-    virtual void onTcpClientDisconnected(TcpServer *sender, TcpClient *client) { }
-  };
-
-  void assignDriver(Driver *driver);
+  void stop();
   bool isRunning() const;
+
+protected:
+  virtual TcpClient *clientAccept(ConnectionParams *params);
+  virtual void clientConnected(TcpClient *client);
+  virtual void clientDisconnected(TcpClient *client);
+
+  struct TcpServerImpl *_p;
 
 private:
   void listenThread();
-
-  struct TcpServerImpl *_p;
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -113,17 +111,13 @@ private:
 class TcpClient
 {
 public:
-  TcpClient(const char *address, int port);
-  TcpClient(TcpServer *server, struct ConnectionParams *params);
-  ~TcpClient();
+  TcpClient(const char *address, int port, bool makeAsync = false);
+  TcpClient(TcpServer *server, ConnectionParams *params, bool makeAsync = false);
+  virtual ~TcpClient();
 
-  struct Driver
-  {
-  
-  };
-
-  void assignDriver(Driver *driver);
+  void disconnect();
   bool isConnected() const;
+  bool isAsync() const;
 
   size_t write(const void *ptr, size_t length);
   bool forceWrite(const void *ptr, size_t length);
@@ -131,8 +125,16 @@ public:
   size_t readLine(void *ptr, size_t length);
   bool forceRead(void *ptr, size_t length);
 
-private:
+protected:
+  void initAsyncThreads();
+  virtual void asyncWriteHandler(const uint8_t *ptr, size_t length);
+  virtual void asyncReadHandler(uint8_t *ptr, size_t length);
+
   struct TcpClientImpl *_p;
+
+private:
+  void writeThread();
+  void readThread();
 };
 
 }
@@ -148,6 +150,7 @@ private:
 #include <vector>
 #include <string>
 #include <mutex>
+#include <map>
 
 #ifdef HEADSOCKET_PLATFORM_WINDOWS
 #pragma comment(lib, "ws2_32.lib")
@@ -182,15 +185,10 @@ struct LockableValue : M
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 //---------------------------------------------------------------------------------------------------------------------
-SHA1::SHA1()
-  : _blockByteIndex(0)
-  , _byteCount(0)
+SHA1::SHA1(): _blockByteIndex(0), _byteCount(0)
 {
-  _digest[0] = 0x67452301;
-  _digest[1] = 0xEFCDAB89;
-  _digest[2] = 0x98BADCFE;
-  _digest[3] = 0x10325476;
-  _digest[4] = 0xC3D2E1F0;
+  uint32_t *d = _digest;
+  *d++ = 0x67452301; *d++ = 0xEFCDAB89; *d++ = 0x98BADCFE; *d++ = 0x10325476;*d++ = 0xC3D2E1F0;
 }
 
 //---------------------------------------------------------------------------------------------------------------------
@@ -210,21 +208,11 @@ void SHA1::processByte(uint8_t octet)
 void SHA1::processBlock(const void *start, const void *end)
 {
   const uint8_t *begin = static_cast<const uint8_t *>(start);
-  const uint8_t *finish = static_cast<const uint8_t *>(end);
-
-  while (begin != finish)
-  {
-    processByte(*begin);
-    begin++;
-  }
+  while (begin != end) processByte(*begin++);
 }
 
 //---------------------------------------------------------------------------------------------------------------------
-void SHA1::processBytes(const void *data, size_t len)
-{
-  const uint8_t *block = static_cast<const uint8_t *>(data);
-  processBlock(block, block + len);
-}
+void SHA1::processBytes(const void *data, size_t len) { processBlock(data, static_cast<const uint8_t *>(data) + len); }
 
 //---------------------------------------------------------------------------------------------------------------------
 const uint32_t *SHA1::getDigest(Digest32 digest)
@@ -240,10 +228,7 @@ const uint32_t *SHA1::getDigest(Digest32 digest)
     while (_blockByteIndex < 56) processByte(0);
 
   processByte(0); processByte(0); processByte(0); processByte(0);
-  processByte(static_cast<unsigned char>((bitCount >> 24) & 0xFF));
-  processByte(static_cast<unsigned char>((bitCount >> 16) & 0xFF));
-  processByte(static_cast<unsigned char>((bitCount >> 8) & 0xFF));
-  processByte(static_cast<unsigned char>((bitCount)& 0xFF));
+  for (int i = 24; i >= 0; i -= 8) processByte(static_cast<unsigned char>((bitCount >> i) & 0xFF));
 
   memcpy(digest, _digest, 5 * sizeof(uint32_t));
   return digest;
@@ -252,144 +237,76 @@ const uint32_t *SHA1::getDigest(Digest32 digest)
 //---------------------------------------------------------------------------------------------------------------------
 const uint8_t *SHA1::getDigestBytes(Digest8 digest)
 {
-  Digest32 d32;
-  getDigest(d32);
-  size_t di = 0;
+  Digest32 d32; getDigest(d32);
+  size_t s[] = { 24, 16, 8, 0 };
 
-  digest[di++] = ((d32[0] >> 24) & 0xFF);
-  digest[di++] = ((d32[0] >> 16) & 0xFF);
-  digest[di++] = ((d32[0] >> 8) & 0xFF);
-  digest[di++] = ((d32[0]) & 0xFF);
-
-  digest[di++] = ((d32[1] >> 24) & 0xFF);
-  digest[di++] = ((d32[1] >> 16) & 0xFF);
-  digest[di++] = ((d32[1] >> 8) & 0xFF);
-  digest[di++] = ((d32[1]) & 0xFF);
-
-  digest[di++] = ((d32[2] >> 24) & 0xFF);
-  digest[di++] = ((d32[2] >> 16) & 0xFF);
-  digest[di++] = ((d32[2] >> 8) & 0xFF);
-  digest[di++] = ((d32[2]) & 0xFF);
-
-  digest[di++] = ((d32[3] >> 24) & 0xFF);
-  digest[di++] = ((d32[3] >> 16) & 0xFF);
-  digest[di++] = ((d32[3] >> 8) & 0xFF);
-  digest[di++] = ((d32[3]) & 0xFF);
-
-  digest[di++] = ((d32[4] >> 24) & 0xFF);
-  digest[di++] = ((d32[4] >> 16) & 0xFF);
-  digest[di++] = ((d32[4] >> 8) & 0xFF);
-  digest[di++] = ((d32[4]) & 0xFF);
-
+  for (size_t i = 0, j = 0; i < 20; ++i, j = i % 4) digest[i] = ((d32[i >> 2] >> s[j]) & 0xFF);
+  
   return digest;
 }
 
 //---------------------------------------------------------------------------------------------------------------------
 void SHA1::processBlock()
 {
-  uint32_t w[80];
+  uint32_t w[80], s[] = { 24, 16, 8, 0 };
 
-  for (size_t i = 0; i < 16; ++i)
+  for (size_t i = 0, j = 0; i < 64; ++i, j = i % 4) w[i >> 2] = j ? (w[i >> 2] | (_block[i] << s[j])) : (_block[i] << s[j]);
+  for (size_t i = 16; i < 80; i++) w[i] = rotateLeft((w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]), 1);
+  Digest32 dig = { _digest[0], _digest[1], _digest[2], _digest[3], _digest[4] };
+
+  for (size_t f, k, i = 0; i < 80; ++i)
   {
-    w[i] = (_block[i * 4 + 0] << 24);
-    w[i] |= (_block[i * 4 + 1] << 16);
-    w[i] |= (_block[i * 4 + 2] << 8);
-    w[i] |= (_block[i * 4 + 3]);
+    if (i < 20) f = (dig[1] & dig[2]) | (~dig[1] & dig[3]), k = 0x5A827999;
+    else if (i < 40) f = dig[1] ^ dig[2] ^ dig[3], k = 0x6ED9EBA1;
+    else if (i < 60) f = (dig[1] & dig[2]) | (dig[1] & dig[3]) | (dig[2] & dig[3]), k = 0x8F1BBCDC;
+    else f = dig[1] ^ dig[2] ^ dig[3], k = 0xCA62C1D6;
+
+    uint32_t temp = rotateLeft(dig[0], 5) + f + dig[4] + k + w[i];
+    dig[4] = dig[3]; dig[3] = dig[2];
+    dig[2] = rotateLeft(dig[1], 30);
+    dig[1] = dig[0]; dig[0] = temp;
   }
 
-  for (size_t i = 16; i < 80; i++)
-    w[i] = rotateLeft((w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]), 1);
-
-  uint32_t a = _digest[0];
-  uint32_t b = _digest[1];
-  uint32_t c = _digest[2];
-  uint32_t d = _digest[3];
-  uint32_t e = _digest[4];
-
-  for (size_t i = 0; i < 80; ++i)
-  {
-    uint32_t f = 0;
-    uint32_t k = 0;
-
-    if (i < 20)
-    {
-      f = (b & c) | (~b & d);
-      k = 0x5A827999;
-    }
-    else if (i < 40)
-    {
-      f = b ^ c ^ d;
-      k = 0x6ED9EBA1;
-    }
-    else if (i < 60)
-    {
-      f = (b & c) | (b & d) | (c & d);
-      k = 0x8F1BBCDC;
-    }
-    else
-    {
-      f = b ^ c ^ d;
-      k = 0xCA62C1D6;
-    }
-
-    uint32_t temp = rotateLeft(a, 5) + f + e + k + w[i];
-    e = d;
-    d = c;
-    c = rotateLeft(b, 30);
-    b = a;
-    a = temp;
-  }
-
-  _digest[0] += a;
-  _digest[1] += b;
-  _digest[2] += c;
-  _digest[3] += d;
-  _digest[4] += e;
+  for (size_t i = 0; i < 5; ++i) _digest[i] += dig[i];
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-size_t Base64::encode(const void *src, size_t srcLength, void *dst, size_t dstLength)
+//---------------------------------------------------------------------------------------------------------------------
+size_t Encoding::base64(const void *src, size_t srcLength, void *dst, size_t dstLength)
 {
-  if (!src || !srcLength || !dst || !dstLength)
-    return 0;
+  if (!src || !srcLength || !dst || !dstLength) return 0;
 
   static const char *encodingTable = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-  static size_t modTable[] = { 0, 2, 1 };
-
-  size_t result = 4 * ((srcLength + 2) / 3);
+  static size_t modTable[] = { 0, 2, 1 }, result = 4 * ((srcLength + 2) / 3);
 
   if (result <= dstLength - 1)
   {
     const uint8_t *input = reinterpret_cast<const uint8_t *>(src);
     uint8_t *output = reinterpret_cast<uint8_t *>(dst);
 
-    for (size_t i = 0, j = 0; i < srcLength; )
+    for (size_t i = 0, j = 0, triplet = 0; i < srcLength; triplet = 0)
     {
-      uint32_t octet_a = i < srcLength ? (uint8_t)input[i++] : 0;
-      uint32_t octet_b = i < srcLength ? (uint8_t)input[i++] : 0;
-      uint32_t octet_c = i < srcLength ? (uint8_t)input[i++] : 0;
-
-      uint32_t triple = (octet_a << 0x10) + (octet_b << 0x08) + octet_c;
-
-      output[j++] = encodingTable[(triple >> 3 * 6) & 0x3F];
-      output[j++] = encodingTable[(triple >> 2 * 6) & 0x3F];
-      output[j++] = encodingTable[(triple >> 1 * 6) & 0x3F];
-      output[j++] = encodingTable[(triple >> 0 * 6) & 0x3F];
+      for (size_t k = 0; k < 3; ++k) triplet = (triplet << 8) | (i < srcLength ? (uint8_t)input[i++] : 0);
+      for (size_t k = 4; k--; ) output[j++] = encodingTable[(triplet >> k * 6) & 0x3F];
     }
 
-    for (size_t i = 0; i < modTable[srcLength % 3]; i++)
-      output[result - 1 - i] = '=';
-
+    for (size_t i = 0; i < modTable[srcLength % 3]; i++) output[result - 1 - i] = '=';
     output[result] = 0;
   }
 
   return result;
 }
 
-size_t Base64::decode(const void *src, size_t srcLength, void *dst, size_t dstLength)
+//---------------------------------------------------------------------------------------------------------------------
+size_t Encoding::xor32(uint32_t key, void *ptr, size_t length)
 {
-  return 0;
+  uint8_t *data = reinterpret_cast<uint8_t *>(ptr);
+  uint8_t *mask = reinterpret_cast<uint8_t *>(&key);
+
+  for (size_t i = 0; i < length; ++i, ++data) *data = (*data) ^ mask[i % 4];
+
+  return length;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -397,22 +314,13 @@ size_t Base64::decode(const void *src, size_t srcLength, void *dst, size_t dstLe
 struct TcpServerImpl
 {
   std::atomic_bool isRunning;
-  int port;
   sockaddr_in local;
-  SOCKET serverSocket;
-  std::thread *listenThread;
-
   LockableValue<std::vector<TcpClient *>> connections;
-  LockableValue<TcpServer::Driver *> driver;
+  int port = 0;
+  SOCKET serverSocket = INVALID_SOCKET;
+  std::thread *listenThread = nullptr;
 
-  TcpServerImpl()
-    : port(0)
-    , serverSocket(INVALID_SOCKET)
-    , listenThread(nullptr)
-  {
-    isRunning = false;
-    driver.value = nullptr;
-  }
+  TcpServerImpl() { isRunning = false; }
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -426,25 +334,21 @@ struct ConnectionParams
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 //---------------------------------------------------------------------------------------------------------------------
-TcpServer::TcpServer(int port)
-  : _p(new TcpServerImpl())
+TcpServer::TcpServer(int port): _p(new TcpServerImpl())
 {
 #ifdef HEADSOCKET_PLATFORM_WINDOWS
   WSADATA wsaData;
   WSAStartup(0x101, &wsaData);
+#endif
 
   _p->local.sin_family = AF_INET;
   _p->local.sin_addr.s_addr = INADDR_ANY;
   _p->local.sin_port = htons(static_cast<unsigned short>(port));
 
   _p->serverSocket = socket(AF_INET, SOCK_STREAM, 0);
-#endif
 
-  if (bind(_p->serverSocket, (sockaddr *)&_p->local, sizeof(_p->local)) != 0)
-    return;
-
-  if (listen(_p->serverSocket, 8))
-    return;
+  if (bind(_p->serverSocket, (sockaddr *)&_p->local, sizeof(_p->local)) != 0) return;
+  if (listen(_p->serverSocket, 8)) return;
 
   _p->isRunning = true;
   _p->port = port;
@@ -454,14 +358,7 @@ TcpServer::TcpServer(int port)
 //---------------------------------------------------------------------------------------------------------------------
 TcpServer::~TcpServer()
 {
-  _p->isRunning = false;
-  closesocket(_p->serverSocket);
-
-  if (_p->listenThread)
-  {
-    _p->listenThread->join();
-    delete _p->listenThread;
-  }
+  stop();
 
 #ifdef HEADSOCKET_PLATFORM_WINDOWS
   WSACleanup();
@@ -471,10 +368,27 @@ TcpServer::~TcpServer()
 }
 
 //---------------------------------------------------------------------------------------------------------------------
-void TcpServer::assignDriver(Driver *driver)
+TcpClient *TcpServer::clientAccept(ConnectionParams *params) { return new TcpClient(this, params); }
+
+//---------------------------------------------------------------------------------------------------------------------
+void TcpServer::clientConnected(TcpClient *client) { }
+
+//---------------------------------------------------------------------------------------------------------------------
+void TcpServer::clientDisconnected(TcpClient *client) { }
+
+//---------------------------------------------------------------------------------------------------------------------
+void TcpServer::stop()
 {
-  HEADSOCKET_LOCK(_p->driver);
-  _p->driver.value = driver;
+  if (_p->isRunning.exchange(false))
+  {
+    closesocket(_p->serverSocket);
+
+    if (_p->listenThread)
+    {
+      _p->listenThread->join();
+      delete _p->listenThread; _p->listenThread = nullptr;
+    }
+  }
 }
 
 //---------------------------------------------------------------------------------------------------------------------
@@ -488,14 +402,15 @@ void TcpServer::listenThread()
     ConnectionParams params;
     params.clientSocket = accept(_p->serverSocket, (struct sockaddr *)&params.from, NULL);
 
-    if (!_p->isRunning)
-      break;
+    if (!_p->isRunning) break;
 
     if (params.clientSocket != INVALID_SOCKET)
     {
-      HEADSOCKET_LOCK(_p->connections);
-      TcpClient *newC = new TcpClient(this, &params);
-      _p->connections->push_back(newC);
+      if (TcpClient *newClient = clientAccept(&params))
+      {
+        { HEADSOCKET_LOCK(_p->connections); _p->connections->push_back(newClient); }
+        clientConnected(newClient);
+      }
     }
   }
 }
@@ -505,31 +420,28 @@ void TcpServer::listenThread()
 struct TcpClientImpl
 {
   std::atomic_bool isConnected;
-  TcpServer *server;
-  SOCKET clientSocket;
   sockaddr_in from;
-  
-  std::string address;
-  int port;
+  CriticalSection writeCS;
+  std::vector<uint8_t> writeBuffer;
+  std::vector<std::tuple<size_t, size_t>> writeSegments;
+  CriticalSection readCS;
+  std::vector<uint8_t> readBuffer;
+  std::vector<std::tuple<size_t, size_t>> readSegments;
+  bool isAsync = false;
+  TcpServer *server = nullptr;
+  SOCKET clientSocket = INVALID_SOCKET;
+  std::string address = "";
+  int port = 0;
+  std::thread *writeThread = nullptr;
+  std::thread *readThread = nullptr;
 
-  LockableValue<TcpClient::Driver *> driver;
-
-  TcpClientImpl()
-    : server(nullptr)
-    , clientSocket(INVALID_SOCKET)
-    , address("")
-    , port(0)
-  {
-    isConnected = false;
-    driver.value = nullptr;
-  }
+  TcpClientImpl() { isConnected = false; }
 };
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 //---------------------------------------------------------------------------------------------------------------------
-TcpClient::TcpClient(const char *address, int port)
-  : _p(new TcpClientImpl())
+TcpClient::TcpClient(const char *address, int port, bool makeAsync): _p(new TcpClientImpl())
 {
   struct addrinfo *result = NULL, *ptr = NULL, hints;
 
@@ -568,79 +480,54 @@ TcpClient::TcpClient(const char *address, int port)
   _p->address = address;
   _p->port = port;
   _p->isConnected = true;
+
+  if (makeAsync) initAsyncThreads();
 }
 
 //---------------------------------------------------------------------------------------------------------------------
-TcpClient::TcpClient(TcpServer *server, ConnectionParams *params)
-  : _p(new TcpClientImpl())
+TcpClient::TcpClient(TcpServer *server, ConnectionParams *params, bool makeAsync): _p(new TcpClientImpl())
 {
   _p->server = server;
   _p->clientSocket = params->clientSocket;
   _p->from = params->from;
-
   _p->isConnected = true;
 
-  std::string key;
-
-  char lineBuffer[1024];
-  while (true)
-  {
-    size_t result = readLine(lineBuffer, 1024);
-    if (result <= 1)
-      break;
-
-    std::cout << lineBuffer << std::endl;
-    
-    if (!memcmp(lineBuffer, "Sec-WebSocket-Key: ", 19))
-      key = lineBuffer + 19;
-  }
-
-  std::cout << "--- END OF HEADER ---" << std::endl;
-  std::cout << key << std::endl;
-
-  key += "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
-
-  SHA1 sha;
-  sha.processBytes(key.c_str(), key.length());
-
-  SHA1::Digest8 digest;
-  sha.getDigestBytes(digest);
-
-  Base64::encode(digest, 20, lineBuffer, 1024);
-  std::cout << lineBuffer << std::endl;
-
-  std::string response =
-    "HTTP/1.1 101 Switching Protocols\n"
-    "Upgrade: websocket\n"
-    "Connection: Upgrade\n"
-    "Sec-WebSocket-Accept: ";
-
-  response += lineBuffer;
-  response += "\n\n";
-
-  write(response.c_str(), response.length());
+  if (makeAsync) initAsyncThreads();
 }
 
 //---------------------------------------------------------------------------------------------------------------------
 TcpClient::~TcpClient()
 {
-  _p->isConnected = false;
-
-  if (!_p->server)
-    closesocket(_p->clientSocket);
-
+  disconnect();
   delete _p;
 }
 
 //---------------------------------------------------------------------------------------------------------------------
-void TcpClient::assignDriver(Driver *driver)
+void TcpClient::disconnect()
 {
-  HEADSOCKET_LOCK(_p->driver);
-  _p->driver.value = driver;
+  if (_p->isConnected.exchange(false))
+  {
+    if (!_p->server)
+    {
+      closesocket(_p->clientSocket);
+      _p->clientSocket = INVALID_SOCKET;
+    }
+
+    if (_p->isAsync)
+    {
+      _p->isAsync = false;
+      _p->writeThread->join(); _p->readThread->join();
+      delete _p->writeThread; _p->writeThread = nullptr;
+      delete _p->readThread; _p->readThread = nullptr;
+    }
+  }
 }
 
 //---------------------------------------------------------------------------------------------------------------------
 bool TcpClient::isConnected() const { return _p->isConnected; }
+
+//---------------------------------------------------------------------------------------------------------------------
+bool TcpClient::isAsync() const { return _p->isAsync; }
 
 //---------------------------------------------------------------------------------------------------------------------
 size_t TcpClient::write(const void *ptr, size_t length)
@@ -727,6 +614,60 @@ bool TcpClient::forceRead(void *ptr, size_t length)
   }
 
   return true;
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+void TcpClient::initAsyncThreads()
+{
+  _p->isAsync = true;
+  _p->writeBuffer.reserve(65536);
+  _p->writeSegments.reserve(1024);
+  _p->readBuffer.reserve(65536);
+  _p->readSegments.reserve(1024);
+  _p->writeThread = new std::thread(std::bind(&TcpClient::writeThread, this));
+  _p->readThread = new std::thread(std::bind(&TcpClient::readThread, this));
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+void TcpClient::writeThread()
+{
+  while (_p->isConnected)
+  {
+  
+  }
+
+  std::cout << "Write thread closed" << std::endl;
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+void TcpClient::asyncWriteHandler(const uint8_t *ptr, size_t length)
+{
+  HEADSOCKET_LOCK(_p->writeCS);
+
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+void TcpClient::asyncReadHandler(uint8_t *ptr, size_t length)
+{
+  HEADSOCKET_LOCK(_p->readCS);
+
+}
+
+//---------------------------------------------------------------------------------------------------------------------
+void TcpClient::readThread()
+{
+  uint8_t buff[1024];
+  while (_p->isConnected)
+  {
+    int result = recv(_p->clientSocket, reinterpret_cast<char *>(buff), 1024, 0);
+    if (!result || result == SOCKET_ERROR)
+      break;
+
+    std::cout << "Bytes received: " << result << std::endl;
+    asyncReadHandler(buff, static_cast<size_t>(result));
+  }
+
+  std::cout << "Read thread closed" << std::endl;
 }
 
 }
